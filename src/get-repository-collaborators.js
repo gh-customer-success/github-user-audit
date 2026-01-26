@@ -5,6 +5,12 @@ import { retry } from '@octokit/plugin-retry';
 // Extend Octokit with throttling and retry plugins
 const OctokitWithPlugins = Octokit.plugin(throttling, retry);
 
+// Configuration constants
+const RATE_LIMIT_RETRY_COUNT = 3;  // Retry up to 3 times on primary rate limit
+const SECONDARY_RATE_LIMIT_RETRY_COUNT = 2;  // Retry up to 2 times on secondary rate limit
+const REPOSITORIES_PER_PAGE = 50;  // Fetch 50 repos per request (reduced from 100 to lower GraphQL cost)
+const COLLABORATORS_PER_PAGE = 100;  // Max allowed by GitHub API
+
 /**
  * Retrieve all repositories and their collaborators in an organization
  * Optimized for large organizations with efficient pagination and rate limit handling
@@ -24,8 +30,8 @@ export const getAllData = async (owner, token, affiliation = 'ALL') => {
           `Request quota exhausted for request ${options.method} ${options.url}`
         );
 
-        // Retry up to 3 times
-        if (retryCount < 3) {
+        // Retry up to RATE_LIMIT_RETRY_COUNT times
+        if (retryCount < RATE_LIMIT_RETRY_COUNT) {
           octokit.log.info(`Retrying after ${retryAfter} seconds!`);
           return true;
         }
@@ -35,8 +41,8 @@ export const getAllData = async (owner, token, affiliation = 'ALL') => {
           `SecondaryRateLimit detected for request ${options.method} ${options.url}`
         );
 
-        // Retry up to 2 times for secondary rate limits
-        if (retryCount < 2) {
+        // Retry up to SECONDARY_RATE_LIMIT_RETRY_COUNT times for secondary rate limits
+        if (retryCount < SECONDARY_RATE_LIMIT_RETRY_COUNT) {
           octokit.log.info(`Retrying after ${retryAfter} seconds!`);
           return true;
         }
@@ -68,7 +74,7 @@ export const getAllData = async (owner, token, affiliation = 'ALL') => {
               resetAt
             }
             organization(login: $owner) {
-              repositories(first: 50, after: $cursor) {
+              repositories(first: ${REPOSITORIES_PER_PAGE}, after: $cursor) {
                 pageInfo {
                   hasNextPage
                   endCursor
@@ -81,7 +87,7 @@ export const getAllData = async (owner, token, affiliation = 'ALL') => {
                     visibility
                     isPrivate
                     archivedAt
-                    collaborators(first: 100, affiliation: $affiliation) {
+                    collaborators(first: ${COLLABORATORS_PER_PAGE}, affiliation: $affiliation) {
                       totalCount
                       pageInfo {
                         hasNextPage
@@ -133,8 +139,10 @@ export const getAllData = async (owner, token, affiliation = 'ALL') => {
         });
 
         // Handle pagination for repositories with more than 100 collaborators
+        let hasMoreCollaborators = collaborators.pageInfo.hasNextPage;
         let collaboratorsCursor = collaborators.pageInfo.endCursor;
-        while (collaborators.pageInfo.hasNextPage && collaboratorsCursor) {
+        
+        while (hasMoreCollaborators && collaboratorsCursor) {
           const additionalCollabsQuery = await octokit.graphql({
             query: `
               query ($owner: String!, $repo: String!, $cursor: String, $affiliation: CollaboratorAffiliation) {
@@ -145,7 +153,7 @@ export const getAllData = async (owner, token, affiliation = 'ALL') => {
                   resetAt
                 }
                 repository(owner: $owner, name: $repo) {
-                  collaborators(first: 100, after: $cursor, affiliation: $affiliation) {
+                  collaborators(first: ${COLLABORATORS_PER_PAGE}, after: $cursor, affiliation: $affiliation) {
                     pageInfo {
                       hasNextPage
                       endCursor
@@ -187,10 +195,9 @@ export const getAllData = async (owner, token, affiliation = 'ALL') => {
             });
           });
 
-          // Update pagination cursor
-          collaboratorsCursor = additionalCollabs.pageInfo.hasNextPage 
-            ? additionalCollabs.pageInfo.endCursor 
-            : null;
+          // Update pagination state
+          hasMoreCollaborators = additionalCollabs.pageInfo.hasNextPage;
+          collaboratorsCursor = additionalCollabs.pageInfo.endCursor;
         }
 
         totalReposProcessed++;
