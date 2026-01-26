@@ -1,17 +1,21 @@
-name: 'Wait'
-description: 'Wait a designated number of milliseconds'
+name: 'GitHub User Audit'
+description: 'Audit users permissions on an organization repositories using GitHub GraphQL API'
 inputs:
   owner:  #This is the org name
     description: 'The Org name containing the repos'
     required: true
     default: ''
-  repo: #the name of the repo
+  repo: #the name of the repo (deprecated, not used)
     description: 'The name of the repo'
-    required: true
+    required: false
     default: ''
   api_token:
     description: 'The API token for authentication'
     required: true
+  affiliation:
+    description: 'Collaborator affiliation filter: ALL (default), DIRECT, or OUTSIDE'
+    required: false
+    default: 'ALL'
 runs:
   using: 'node16'
   main: 'dist/index.js'

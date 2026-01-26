@@ -5,8 +5,16 @@ import { retry } from '@octokit/plugin-retry';
 // Extend Octokit with throttling and retry plugins
 const OctokitWithPlugins = Octokit.plugin(throttling, retry);
 
-// Function to retrieve all the repositories and their collaborators in an organization
-export const getAllData = async (owner, token) => {
+/**
+ * Retrieve all repositories and their collaborators in an organization
+ * Optimized for large organizations with efficient pagination and rate limit handling
+ * 
+ * @param {string} owner - Organization login name
+ * @param {string} token - GitHub Personal Access Token with repo and read:org scopes
+ * @param {string} affiliation - Collaborator affiliation filter: ALL, DIRECT, or OUTSIDE
+ * @returns {Promise<{repositories: Array}>} Array of repositories with collaborators
+ */
+export const getAllData = async (owner, token, affiliation = 'ALL') => {
   // Create an Octokit client with throttling and retry plugins
   const octokit = new OctokitWithPlugins({
     auth: token,
@@ -41,39 +49,51 @@ export const getAllData = async (owner, token) => {
 
   let repositories = [];
   let repositoriesCursor = null;
+  let totalReposProcessed = 0;
 
-  // Paginate through the repositories and their collaborators
+  console.log(`Starting audit for organization: ${owner}`);
+  console.log(`Collaborator affiliation filter: ${affiliation}`);
+
+  // Paginate through the repositories
   do {
-    // Query the organization's repositories with pagination
-    const repositoriesQuery = await octokit.graphql({
-      query: `
-        query ($owner: String!, $cursor: String) {
-          rateLimit {
-            limit
-            cost
-            remaining
-            resetAt
-          }
-          organization(login: $owner) {
-            repositories(first: 100 after: $cursor) {
-              pageInfo {
-                hasNextPage
-                endCursor
-              }
-              edges {
-                node {
-                  name
-                  collaborators(first: 100) {
-                    pageInfo {
-                      hasNextPage
-                      endCursor
-                    }
-                    edges {
-                      permission
-                      node {
-                        login
-                        name
-                        email
+    try {
+      // Query the organization's repositories with enhanced fields
+      const repositoriesQuery = await octokit.graphql({
+        query: `
+          query ($owner: String!, $cursor: String, $affiliation: CollaboratorAffiliation) {
+            rateLimit {
+              limit
+              cost
+              remaining
+              resetAt
+            }
+            organization(login: $owner) {
+              repositories(first: 50, after: $cursor) {
+                pageInfo {
+                  hasNextPage
+                  endCursor
+                }
+                totalCount
+                edges {
+                  node {
+                    name
+                    isArchived
+                    visibility
+                    isPrivate
+                    archivedAt
+                    collaborators(first: 100, affiliation: $affiliation) {
+                      totalCount
+                      pageInfo {
+                        hasNextPage
+                        endCursor
+                      }
+                      edges {
+                        permission
+                        node {
+                          login
+                          name
+                          email
+                        }
                       }
                     }
                   }
@@ -81,32 +101,43 @@ export const getAllData = async (owner, token) => {
               }
             }
           }
-        }
-      `,
-      owner,
-      cursor: repositoriesCursor,
-    });
+        `,
+        owner,
+        cursor: repositoriesCursor,
+        affiliation,
+      });
 
-    // Log rate limit information
-    const { rateLimit } = repositoriesQuery;
-    console.log(
-      `Rate limit: ${rateLimit.remaining}/${rateLimit.limit} (cost: ${rateLimit.cost}, resets at: ${rateLimit.resetAt})`
-    );
+      // Log rate limit information
+      const { rateLimit } = repositoriesQuery;
+      console.log(
+        `Rate limit: ${rateLimit.remaining}/${rateLimit.limit} (cost: ${rateLimit.cost}, resets at: ${rateLimit.resetAt})`
+      );
 
-    // Extract the repositories and their collaborators from the query result
-    const { repositories: repoData } = repositoriesQuery.organization;
+      // Extract the repositories and their collaborators from the query result
+      const { repositories: repoData } = repositoriesQuery.organization;
 
-    // Map over the repositories and their collaborators to extract the relevant data
-    const repositoriesWithCollaborators = await Promise.all(
-      repoData.edges.map(async (edge) => {
-        const { name, collaborators } = edge.node;
+      // Process each repository and handle collaborator pagination if needed
+      for (const edge of repoData.edges) {
+        const { name, collaborators, isArchived, visibility, isPrivate, archivedAt } = edge.node;
         const collabPermissions = [];
 
-        // Recursively retrieve all the collaborators for a repository with pagination
-        async function getCollaborators(cursor) {
-          const collaboratorsQuery = await octokit.graphql({
+        // Extract collaborators from the first page
+        collaborators.edges.forEach((collab) => {
+          const { permission, node } = collab;
+          collabPermissions.push({ 
+            login: node.login, 
+            permission,
+            name: node.name,
+            email: node.email
+          });
+        });
+
+        // Handle pagination for repositories with more than 100 collaborators
+        let collaboratorsCursor = collaborators.pageInfo.endCursor;
+        while (collaborators.pageInfo.hasNextPage && collaboratorsCursor) {
+          const additionalCollabsQuery = await octokit.graphql({
             query: `
-              query ($owner: String!, $repo: String!, $cursor: String) {
+              query ($owner: String!, $repo: String!, $cursor: String, $affiliation: CollaboratorAffiliation) {
                 rateLimit {
                   limit
                   cost
@@ -114,7 +145,7 @@ export const getAllData = async (owner, token) => {
                   resetAt
                 }
                 repository(owner: $owner, name: $repo) {
-                  collaborators(first: 100 after: $cursor) {
+                  collaborators(first: 100, after: $cursor, affiliation: $affiliation) {
                     pageInfo {
                       hasNextPage
                       endCursor
@@ -133,51 +164,65 @@ export const getAllData = async (owner, token) => {
             `,
             owner,
             repo: name,
-            cursor,
+            cursor: collaboratorsCursor,
+            affiliation,
           });
 
-          // Log rate limit information for nested queries
-          const { rateLimit } = collaboratorsQuery;
+          // Log rate limit for additional collaborator queries
+          const { rateLimit: collabRateLimit } = additionalCollabsQuery;
           console.log(
-            `Rate limit (collaborators for ${name}): ${rateLimit.remaining}/${rateLimit.limit} (cost: ${rateLimit.cost})`
+            `Rate limit (additional collaborators for ${name}): ${collabRateLimit.remaining}/${collabRateLimit.limit} (cost: ${collabRateLimit.cost})`
           );
 
-          const { collaborators: collabData } = collaboratorsQuery.repository;
+          const { collaborators: additionalCollabs } = additionalCollabsQuery.repository;
 
-          // Extract the collaborators and their permissions from the query result
-          collabData.edges.forEach((collab) => {
+          // Extract additional collaborators
+          additionalCollabs.edges.forEach((collab) => {
             const { permission, node } = collab;
-            collabPermissions.push({ login: node.login, permission });
+            collabPermissions.push({ 
+              login: node.login, 
+              permission,
+              name: node.name,
+              email: node.email
+            });
           });
 
-          // Recursively retrieve the next page of collaborators if there are more
-          if (collabData.pageInfo.hasNextPage) {
-            await getCollaborators(collabData.pageInfo.endCursor);
-          }
+          // Update pagination cursor
+          collaboratorsCursor = additionalCollabs.pageInfo.hasNextPage 
+            ? additionalCollabs.pageInfo.endCursor 
+            : null;
         }
 
-        // Extract the collaborators and their permissions from the query result
-        collaborators.edges.forEach((collab) => {
-          const { permission, node } = collab;
-          collabPermissions.push({ login: node.login, permission });
+        totalReposProcessed++;
+        console.log(
+          `Processed repository ${totalReposProcessed}/${repoData.totalCount}: ${name} (${collabPermissions.length} collaborators, archived: ${isArchived}, visibility: ${visibility})`
+        );
+
+        // Add repository with all metadata
+        repositories.push({ 
+          name, 
+          collaborators: collabPermissions,
+          isArchived,
+          visibility,
+          isPrivate,
+          archivedAt,
+          collaboratorCount: collabPermissions.length
         });
+      }
 
-        // Recursively retrieve the next page of collaborators if there are more
-        if (collaborators.pageInfo.hasNextPage) {
-          await getCollaborators(collaborators.pageInfo.endCursor);
-        }
+      // Update the cursor for the next page of repositories
+      repositoriesCursor = repoData.pageInfo.hasNextPage ? repoData.pageInfo.endCursor : null;
 
-        // Return an object with the repository name and its collaborators and permissions
-        return { name, collaborators: collabPermissions };
-      })
-    );
-
-    // Concatenate the repositories and their collaborators to the overall list
-    repositories = repositories.concat(repositoriesWithCollaborators);
-
-    // Update the cursor for the next page of repositories
-    repositoriesCursor = repoData.pageInfo.endCursor;
+    } catch (error) {
+      console.error(`Error fetching repositories: ${error.message}`);
+      if (error.response) {
+        console.error('GraphQL Errors:', JSON.stringify(error.response.errors, null, 2));
+      }
+      throw error;
+    }
   } while (repositoriesCursor !== null);
+
+  console.log(`\nAudit complete! Processed ${totalReposProcessed} repositories with ${repositories.reduce((sum, r) => sum + r.collaborators.length, 0)} total collaborator entries.`);
 
   // Return an object with the list of repositories and their collaborators and permissions
   return { repositories };
