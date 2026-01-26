@@ -10,13 +10,14 @@ async function run() {
     const repo = core.getInput('repo');
     const owner = core.getInput('owner');
     const token = core.getInput('api_token');
+    const affiliation = core.getInput('affiliation') || 'ALL';
 
     //call the getTeams function and pass in data
     //not implemented for now
     // const teams = getTeams(data); 
     //call the getRepos function and pass in data 
 
-    getAllData(owner, token).then(({ repositories }) => {
+    getAllData(owner, token, affiliation).then(({ repositories }) => {
       console.log(JSON.stringify(repositories) + "\n");
 
 
